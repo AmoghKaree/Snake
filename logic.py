@@ -49,27 +49,72 @@ def print_board(game_state):
 #  MAIN DECISION FUNCTION
 # =================================================================
 
+DEBUG = False   # Set True locally; never True in production
+
 def choose_best_move(game_state):
+    
     print_board(game_state)
 
     safe_moves = get_safe_moves(game_state)
+    in_risky_fallback = False
 
     if not safe_moves:
-        print("  !! No safe moves — going up and praying")
+        # Absolute fallback — all moves hit walls or bodies
         return "up"
+
+    # Detect if safe_moves is actually the risky fallback list
+    # by checking if we recompute risky ourselves
+    all_moves = ["up", "down", "left", "right"]
+    my_head   = game_state['you']['head']
+    board_w   = game_state['board']['width']
+    board_h   = game_state['board']['height']
+    my_length = game_state['you']['length']
+
+    occupied = set()
+    for snake in game_state['board']['snakes']:
+        tail_stays = _tail_will_stay(snake, game_state['board'])
+        for i, part in enumerate(snake['body']):
+            if not tail_stays and i == len(snake['body']) - 1:
+                continue
+            occupied.add((part['x'], part['y']))
+
+    danger_squares = set()
+    for snake in game_state['board']['snakes']:
+        if snake['id'] == game_state['you']['id']:
+            continue
+        if snake['length'] >= my_length:
+            for move in all_moves:
+                nc = get_next_coord(snake['head'], move)
+                nx, ny = nc['x'], nc['y']
+                if 0 <= nx < board_w and 0 <= ny < board_h:
+                    danger_squares.add((nx, ny))
+
+    truly_safe = []
+    for move in all_moves:
+        nc = get_next_coord(my_head, move)
+        nx, ny = nc['x'], nc['y']
+        if not (0 <= nx < board_w and 0 <= ny < board_h):
+            continue
+        if (nx, ny) in occupied:
+            continue
+        if (nx, ny) not in danger_squares:
+            truly_safe.append(move)
+
+    in_risky_fallback = (len(truly_safe) == 0)
 
     best_move     = safe_moves[0]
     highest_score = -math.inf
 
     for move in safe_moves:
-        score = evaluate_move(move, game_state)
-        print(f"  {move:5} -> {score:.2f}")
-
+        score = evaluate_move(move, game_state, in_risky_fallback=in_risky_fallback)
+        if DEBUG:
+            print(f"  {move:5} -> {score:.2f}")
         if score > highest_score:
             highest_score = score
             best_move     = move
 
-    print(f"  Chosen: {best_move}\n")
+    if DEBUG:
+        print(f"  Chosen: {best_move}\n")
     return best_move
 
 
@@ -82,20 +127,11 @@ def _tail_will_stay(snake, board):
     Returns True if this snake's tail will NOT vacate this turn, meaning
     we should treat the tail square as still occupied.
 
-    Tail stays when:
-      a) Snake just ate (health == 100) — body grows, tail doesn't move, OR
-      b) Snake's head is adjacent to food and could eat this turn.
-         We can't know which direction the enemy will move, so we are
-         conservative: if any neighbour of their head is food, keep tail.
+    Only case we can guarantee: snake just ate (health == 100) — body grows,
+    tail doesn't move.  The old heuristic of treating any food-adjacent enemy
+    tail as staying was over-conservative and blocked valid escape routes.
     """
-    if snake['health'] == 100:
-        return True   # ate last turn, tail already staying
-    food_set = {(f['x'], f['y']) for f in board['food']}
-    head = snake['head']
-    for dx, dy in [(0, 1), (0, -1), (-1, 0), (1, 0)]:
-        if (head['x'] + dx, head['y'] + dy) in food_set:
-            return True   # snake can eat this turn — treat tail as staying
-    return False
+    return snake['health'] == 100
 
 
 # =================================================================
@@ -164,7 +200,7 @@ def get_safe_moves(game_state):
 _THREAT_PENALTY = {1: -120, 2: -70, 3: -25, 4: -8}
 
 
-def evaluate_move(move, game_state):
+def evaluate_move(move, game_state, in_risky_fallback=False):
     """
     Scores a candidate move across six dimensions.
 
@@ -189,12 +225,19 @@ def evaluate_move(move, game_state):
     space       = calculate_flood_fill(next_head, game_state)
     space_ratio = space / board_size          # 0.0 → 1.0
 
+    if space == 0:
+        return -9999   # completely walled in — discard immediately
+
     if space < my_length:
-        return -9999   # hard trap — discard immediately
+        # Trapped but not zero — scale penalty so more space = less bad.
+        # This lets the evaluator differentiate between "2 cells" and "1 cell"
+        # rather than treating both as identically hopeless.
+        trap_severity = 1.0 - (space / my_length)   # 0→1 as space→0
+        return -500 - trap_severity * 500            # range: -500 to -1000
 
     score += space_ratio * 100                # max 100 pts
 
-    # FIX #3 — soft-trap penalty: space close to my_length is still risky
+    # Soft-trap penalty: space close to my_length is still risky
     if space < 2 * my_length:
         tightness = 1.0 - (space / (2.0 * my_length))   # 0→1 as space→0
         score -= tightness * 40                           # up to -40 pts
@@ -203,24 +246,58 @@ def evaluate_move(move, game_state):
     # 2. FOOD — urgency-scaled, A*-distance, competition-aware
     # ------------------------------------------------------------------
     base         = (100 - health) / 100
-    # FIX #5 — urgency ramps earlier (exponent 1.2 not 1.5) with higher floor
-    food_urgency = 0.30 + 0.70 * (base ** 1.2)    # range [0.30, 1.00]
+    # Raised floor to 0.40 and steeper exponent so mid-HP (50-70) snakes
+    # actively pursue food instead of wandering 47 turns at len=4.
+    food_urgency = 0.40 + 0.60 * (base ** 1.0)    # range [0.40, 1.00]
 
     best_food_score = 0
     if board['food']:
+        # Pre-compute whether next_head is itself a danger square
+        board_w = board['width']
+        board_h = board['height']
+        next_is_danger = False
+        for snake in board['snakes']:
+            if snake['id'] == my_snake['id']:
+                continue
+            if snake['length'] >= my_length:
+                for mv2 in ["up", "down", "left", "right"]:
+                    nc2 = get_next_coord(snake['head'], mv2)
+                    if nc2['x'] == next_head['x'] and nc2['y'] == next_head['y']:
+                        next_is_danger = True
+                        break
+
         for food in board['food']:
             path_len = astar_distance(next_head, food, game_state)
             if path_len is None:
                 continue
 
-            # FIX #2 — food competition: discount food an enemy can reach first
+            # Competition: use A*-equivalent (manhattan) for enemy distance too
+            # Zero out food score if ANY bigger/equal enemy can reach it in <= our steps
             my_steps = path_len + 1    # steps from our current position
-            enemy_min_dist = min(
-                (manhattan(s['head'], food)
-                 for s in board['snakes'] if s['id'] != my_snake['id']),
-                default=999
-            )
-            competition_factor = 0.35 if enemy_min_dist <= my_steps else 1.0
+            enemy_min_dist = 999
+            bigger_enemy_can_contest = False
+            for s in board['snakes']:
+                if s['id'] == my_snake['id']:
+                    continue
+                ed = manhattan(s['head'], food)
+                if ed < enemy_min_dist:
+                    enemy_min_dist = ed
+                # If a bigger/equal enemy can reach it in <= our steps, zero food value
+                if s['length'] >= my_length and ed <= my_steps:
+                    bigger_enemy_can_contest = True
+
+            if bigger_enemy_can_contest:
+                competition_factor = 0.0   # don't chase food a bigger snake will win
+            elif enemy_min_dist <= my_steps:
+                competition_factor = 0.35  # smaller enemy closer — slight discount
+            else:
+                competition_factor = 1.0
+
+            # If we're in risky fallback AND this food square is a danger square,
+            # don't reward heading there (that's how Thunga died at T103)
+            food_at_next = (food['x'] == next_head['x'] and food['y'] == next_head['y'])
+            if in_risky_fallback and food_at_next and next_is_danger:
+                competition_factor = 0.0
 
             candidate = (1 / (path_len + 1)) * food_urgency * 80 * competition_factor
             if candidate > best_food_score:
@@ -228,9 +305,11 @@ def evaluate_move(move, game_state):
 
     score += best_food_score                  # max  80 pts
 
-    # Emergency starvation override — health critical: massive food bonus
+    # Emergency starvation override — health critical: add extra weight on top
+    # Fixed: was adding best_food_score * 1.5 ON TOP of already-added score
+    # (effectively 2.5x). Now correctly adds 0.5x as a true bonus = 1.5x total.
     if health <= 25 and best_food_score > 0:
-        score += best_food_score * 1.5        # double-weight food when near-dead
+        score += best_food_score * 0.5        # total food weight = 1.5x when near-dead
 
     # ------------------------------------------------------------------
     # 3. CENTER CONTROL
@@ -332,11 +411,11 @@ def calculate_flood_fill(head, game_state):
 
 def calculate_voronoi_space(head, game_state):
     """
-    Multi-source BFS race from our next_head and all enemy heads.
+    Multi-source Dijkstra race from our next_head and all enemy heads.
     Returns the number of board cells closer to our head than to
-    any enemy head (ties go to neither).  This measures our 'territory'
-    in a competitive game — more accurately than pure flood fill when
-    multiple snakes are converging.
+    any enemy head (ties go to neither).  Uses a min-heap to guarantee
+    correct shortest-path order — the plain deque version could process
+    updates out of order when a shorter path was found.
     """
     board   = game_state['board']
     width   = board['width']
@@ -353,13 +432,13 @@ def calculate_voronoi_space(head, game_state):
 
     # dist_map: pos -> (min_dist, owner)  owner='tie' means contested
     dist_map = {}
-    queue    = deque()
+    heap     = []   # (dist, pos, owner)
 
     # Seed our next head
     our_pos = (head['x'], head['y'])
     if our_pos not in occupied:
         dist_map[our_pos] = (0, 'our')
-        queue.append((0, our_pos, 'our'))
+        heapq.heappush(heap, (0, our_pos, 'our'))
 
     # Seed all enemy heads
     for snake in board['snakes']:
@@ -370,19 +449,21 @@ def calculate_voronoi_space(head, game_state):
             continue
         if epos not in dist_map:
             dist_map[epos] = (0, snake['id'])
-            queue.append((0, epos, snake['id']))
+            heapq.heappush(heap, (0, epos, snake['id']))
         else:
-            existing_d, _ = dist_map[epos]
-            if existing_d == 0:
+            existing_d, existing_owner = dist_map[epos]
+            if existing_d == 0 and existing_owner != snake['id']:
                 dist_map[epos] = (0, 'tie')
 
-    while queue:
-        d, pos, owner = queue.popleft()
+    while heap:
+        d, pos, owner = heapq.heappop(heap)
+
+        # Stale entry check
         existing_d, existing_owner = dist_map.get(pos, (None, None))
         if existing_d is None or d > existing_d:
             continue
-        if existing_owner == 'tie':
-            continue   # don't expand from contested cells
+        if existing_owner == 'tie' and owner != 'tie':
+            continue   # this cell is already contested, don't expand for old owner
 
         x, y = pos
         for dx, dy in [(0, 1), (0, -1), (-1, 0), (1, 0)]:
@@ -395,14 +476,15 @@ def calculate_voronoi_space(head, game_state):
             new_pos = (nx, ny)
             if new_pos not in dist_map:
                 dist_map[new_pos] = (new_d, owner)
-                queue.append((new_d, new_pos, owner))
+                heapq.heappush(heap, (new_d, new_pos, owner))
             else:
                 prev_d, prev_owner = dist_map[new_pos]
                 if new_d < prev_d:
                     dist_map[new_pos] = (new_d, owner)
-                    queue.append((new_d, new_pos, owner))
+                    heapq.heappush(heap, (new_d, new_pos, owner))
                 elif new_d == prev_d and prev_owner != owner and prev_owner != 'tie':
                     dist_map[new_pos] = (new_d, 'tie')
+                    # Don't push tie expansions — tied cells don't propagate
 
     return sum(1 for (_, owner) in dist_map.values() if owner == 'our')
 
@@ -461,51 +543,6 @@ def astar_distance(start, goal, game_state):
     return None   # unreachable
 
 
-def astar(start, goal, game_state):
-    """
-    Returns first move direction toward `goal`, or None.
-    """
-    board  = game_state['board']
-    width  = board['width']
-    height = board['height']
-
-    occupied = set()
-    for snake in game_state['board']['snakes']:
-        for part in snake['body']:
-            occupied.add((part['x'], part['y']))
-
-    start_pos = (start['x'], start['y'])
-    goal_pos  = (goal['x'],  goal['y'])
-
-    h0    = manhattan(start, goal)
-    heap  = [(h0, 0, start_pos, None)]   # (f, g, pos, first_move)
-    g_scores = {start_pos: 0}
-
-    while heap:
-        f, g, pos, first_move = heapq.heappop(heap)
-
-        if pos == goal_pos:
-            return first_move
-
-        if g > g_scores.get(pos, float('inf')):
-            continue
-
-        x, y = pos
-        for move, (dx, dy) in [("up",(0,1)),("down",(0,-1)),
-                                ("left",(-1,0)),("right",(1,0))]:
-            nx, ny = x + dx, y + dy
-            if not (0 <= nx < width and 0 <= ny < height):
-                continue
-            if (nx, ny) in occupied:
-                continue
-            new_g = g + 1
-            if new_g < g_scores.get((nx, ny), float('inf')):
-                g_scores[(nx, ny)] = new_g
-                new_f = new_g + manhattan({"x": nx, "y": ny}, goal)
-                next_first = first_move if first_move else move
-                heapq.heappush(heap, (new_f, new_g, (nx, ny), next_first))
-
-    return None
 
 
 # =================================================================
